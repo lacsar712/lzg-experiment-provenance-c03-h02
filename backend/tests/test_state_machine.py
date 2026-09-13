@@ -99,7 +99,7 @@ def test_start_and_complete_happy_path(db):
         )
 
 
-def test_optimistic_lock_conflict(db):
+def test_metric_stale_expected_version_conflicts(db):
     run = start_run(
         db,
         actor="researcher",
@@ -109,16 +109,123 @@ def test_optimistic_lock_conflict(db):
         code_commit_sha="abc1234",
         description=None,
     )
-    # Weakened: stale expected_version path not locked in this fixture copy.
-    record_metric(
+    assert run.version == 1
+
+    # expected_version=0 on an existing v1 run must conflict and append nothing
+    with pytest.raises(ConflictError):
+        record_metric(
+            db,
+            run_id=run.id,
+            actor="researcher",
+            name="loss",
+            value=1.0,
+            step=1,
+            expected_version=0,
+        )
+    assert db.get(RunProjection, run.id).version == 1
+    assert [e.event_type for e in list_events(db, run.id)] == ["RunStarted"]
+
+    # a correct version advances to v2 ...
+    run = record_metric(
         db,
         run_id=run.id,
         actor="researcher",
         name="loss",
         value=1.0,
         step=1,
-        expected_version=0,
+        expected_version=1,
     )
+    assert run.version == 2
+
+    # ... and replaying the same stale version (1) conflicts without appending
+    with pytest.raises(ConflictError):
+        record_metric(
+            db,
+            run_id=run.id,
+            actor="researcher",
+            name="loss",
+            value=2.0,
+            step=2,
+            expected_version=1,
+        )
+    with pytest.raises(ConflictError):
+        record_metric(
+            db,
+            run_id=run.id,
+            actor="researcher",
+            name="loss",
+            value=2.0,
+            step=2,
+            expected_version=0,
+        )
+    # a future/gap version must conflict too — no holes in the event stream
+    with pytest.raises(ConflictError):
+        record_metric(
+            db,
+            run_id=run.id,
+            actor="researcher",
+            name="loss",
+            value=2.0,
+            step=2,
+            expected_version=9,
+        )
+
+    stored = db.get(RunProjection, run.id)
+    assert stored.version == 2
+    assert len(stored.metrics_json) == 1
+    assert [(e.version, e.event_type) for e in list_events(db, run.id)] == [
+        (1, "RunStarted"),
+        (2, "MetricRecorded"),
+    ]
+
+    # session still usable after the conflicts; correct version goes through
+    run = record_metric(
+        db,
+        run_id=run.id,
+        actor="researcher",
+        name="acc",
+        value=0.9,
+        step=2,
+        expected_version=2,
+    )
+    assert run.version == 3
+
+
+def test_metric_lock_parity_with_other_commands(db):
+    """Stale expected_version on Metric must behave like Artifact/Complete/Abort."""
+    run = start_run(
+        db,
+        actor="researcher",
+        project="p1",
+        name="n1",
+        dataset_content_sha256=sha("ds-parity"),
+        code_commit_sha="abc1234",
+        description=None,
+    )
+    stale = 0  # current version is 1
+    with pytest.raises(ConflictError):
+        record_metric(
+            db, run_id=run.id, actor="researcher", name="m", value=1.0, step=0,
+            expected_version=stale,
+        )
+    with pytest.raises(ConflictError):
+        attach_artifact(
+            db, run_id=run.id, actor="researcher", name="a", uri="file:///x",
+            content_sha256=sha("a"), media_type=None, expected_version=stale,
+        )
+    with pytest.raises(ConflictError):
+        complete_run(
+            db, run_id=run.id, actor="researcher",
+            result_summary="done", expected_version=stale,
+        )
+    with pytest.raises(ConflictError):
+        abort_run(
+            db, run_id=run.id, actor="researcher",
+            reason="x", expected_version=stale,
+        )
+    # nothing landed through any path
+    assert db.get(RunProjection, run.id).version == 1
+    assert [e.event_type for e in list_events(db, run.id)] == ["RunStarted"]
 
 
 def test_abort_terminal(db):

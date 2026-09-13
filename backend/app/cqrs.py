@@ -198,6 +198,7 @@ def record_metric(
 ) -> RunProjection:
     proj = _get_projection(db, run_id)
     _require_running(proj)
+    _check_expected_version(proj, expected_version)
 
     event = _append_event(
         db,
